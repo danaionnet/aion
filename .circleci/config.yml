@@ -17,7 +17,6 @@ jobs:
   build:
     working_directory: ~/repo
     machine: true
-      # - image: circleci/openjdk:11.0.2-jdk-stretch
     environment:
       TERM: dumb
       GIT_BRANCH: ${CIRCLE_BRANCH}
@@ -35,6 +34,11 @@ jobs:
       - run:
           name: Create build artifacts directory
           command: mkdir -p ~/pack
+
+      # Install JDK 11
+      - run:
+          name: Install JDK 11
+          command: sudo apt-get update && sudo apt-get install -y openjdk-11-jdk
 
       # Create symlink for current Java release *** (temporary step until JAVA_HOME can be used)
       - run:
