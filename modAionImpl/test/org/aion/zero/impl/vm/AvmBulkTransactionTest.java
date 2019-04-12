@@ -10,18 +10,16 @@ import java.util.List;
 import org.aion.avm.core.dappreading.JarBuilder;
 import org.aion.avm.core.util.ABIUtil;
 import org.aion.avm.core.util.CodeAndArguments;
-import org.aion.avm.userlib.abi.ABIDecoder;
-import org.aion.avm.userlib.abi.ABIEncoder;
 import org.aion.crypto.ECKey;
 import org.aion.crypto.ECKeyFac;
 import org.aion.mcf.core.ImportResult;
+import org.aion.mcf.tx.TransactionTypes;
 import org.aion.mcf.valid.TransactionTypeRule;
 import org.aion.types.Address;
 import org.aion.vm.VirtualMachineProvider;
 import org.aion.zero.impl.StandaloneBlockchain;
 import org.aion.zero.impl.types.AionBlock;
 import org.aion.zero.impl.types.AionBlockSummary;
-import org.aion.mcf.tx.TransactionTypes;
 import org.aion.zero.impl.vm.contracts.Statefulness;
 import org.aion.zero.types.AionTransaction;
 import org.aion.zero.types.AionTxExecSummary;
@@ -40,12 +38,17 @@ public class AvmBulkTransactionTest {
 
     @BeforeClass
     public static void setupAvm() {
+        if (VirtualMachineProvider.isMachinesAreLive()) {
+            return;
+        }
         VirtualMachineProvider.initializeAllVirtualMachines();
     }
 
     @AfterClass
     public static void tearDownAvm() {
-        VirtualMachineProvider.shutdownAllVirtualMachines();
+        if (VirtualMachineProvider.isMachinesAreLive()) {
+            VirtualMachineProvider.shutdownAllVirtualMachines();
+        }
     }
 
     @Before
@@ -58,13 +61,14 @@ public class AvmBulkTransactionTest {
                         .build();
         this.blockchain = bundle.bc;
         this.deployerKey = bundle.privateKeys.get(0);
-        TransactionTypeRule.allowAVMContractDeployment();
+        TransactionTypeRule.allowAVMContractTransaction();
     }
 
     @After
     public void tearDown() {
         this.blockchain = null;
         this.deployerKey = null;
+        TransactionTypeRule.disallowAVMContractTransaction();
     }
 
     @Test
@@ -234,7 +238,7 @@ public class AvmBulkTransactionTest {
                         abiEncodeMethodCall("incrementCounter"),
                         2_000_000,
                         this.energyPrice,
-                        TransactionTypes.AVM_CREATE_CODE);
+                        TransactionTypes.DEFAULT);
         transaction.sign(this.deployerKey);
         return transaction;
     }
@@ -270,13 +274,12 @@ public class AvmBulkTransactionTest {
                         abiEncodeMethodCall("getCount"),
                         2_000_000,
                         this.energyPrice,
-                        TransactionTypes.AVM_CREATE_CODE);
+                        TransactionTypes.DEFAULT);
         transaction.sign(sender);
 
         AionBlockSummary summary =
                 sendTransactionsInBulkInSingleBlock(Collections.singletonList(transaction));
-        return (int)
-                ABIUtil.decodeOneObject(summary.getReceipts().get(0).getTransactionOutput());
+        return (int) ABIUtil.decodeOneObject(summary.getReceipts().get(0).getTransactionOutput());
     }
 
     private AionBlockSummary sendTransactionsInBulkInSingleBlock(

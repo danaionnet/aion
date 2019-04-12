@@ -3,15 +3,20 @@ package org.aion.vm;
 import static org.aion.mcf.valid.TransactionTypeRule.isValidAVMContractDeployment;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import org.aion.fastvm.FastVmResultCode;
 import org.aion.fastvm.SideEffects;
 import org.aion.interfaces.db.Repository;
 import org.aion.interfaces.db.RepositoryCache;
+import org.aion.interfaces.tx.Transaction;
 import org.aion.interfaces.tx.TxExecSummary;
+import org.aion.interfaces.vm.DataWord;
 import org.aion.kernel.AvmTransactionResult;
 import org.aion.mcf.core.AccountState;
 import org.aion.mcf.db.IBlockStoreBase;
+import org.aion.mcf.tx.TransactionTypes;
+import org.aion.mcf.vm.types.DataWordImpl;
 import org.aion.mcf.vm.types.KernelInterfaceForFastVM;
 import org.aion.mcf.vm.types.Log;
 import org.aion.precompiled.ContractFactory;
@@ -22,13 +27,13 @@ import org.aion.vm.api.interfaces.IExecutionLog;
 import org.aion.vm.api.interfaces.KernelInterface;
 import org.aion.vm.api.interfaces.ResultCode;
 import org.aion.vm.api.interfaces.SimpleFuture;
-import org.aion.vm.api.interfaces.TransactionContext;
 import org.aion.vm.api.interfaces.TransactionResult;
 import org.aion.vm.api.interfaces.VirtualMachine;
 import org.aion.vm.exception.VMException;
 import org.aion.zero.types.AionTransaction;
 import org.aion.zero.types.AionTxExecSummary;
 import org.aion.zero.types.AionTxReceipt;
+import org.aion.zero.types.IAionBlock;
 import org.slf4j.Logger;
 
 /**
@@ -56,13 +61,6 @@ import org.slf4j.Logger;
  */
 public class BulkExecutor {
     private static final Object LOCK = new Object();
-
-    private static boolean avmEnabled = false;
-
-    public static void enabledAvmCheck(boolean isEnabled) {
-        avmEnabled = isEnabled;
-    }
-
     private Repository repository;
     private RepositoryCache<AccountState, IBlockStoreBase<?, ?>> repositoryChild;
     private PostExecutionWork postExecutionWork;
@@ -71,6 +69,7 @@ public class BulkExecutor {
     private boolean isLocalCall;
     private boolean allowNonceIncrement;
     private long blockRemainingEnergy;
+    private boolean fork040enable;
 
     /**
      * Constructs a new bulk executor that will execute the transactions contained in the provided
@@ -87,6 +86,7 @@ public class BulkExecutor {
      * @param isLocalCall Whether or not the call is a network or local call.
      * @param allowNonceIncrement Whether or not to increment the sender's nonce.
      * @param blockRemainingEnergy The amount of energy remaining in the block.
+     * @param fork040Enable the fork logic affect the fvm behavior.
      * @param logger The logger.
      * @param work The post-execution work to apply after each transaction is run.
      */
@@ -97,6 +97,7 @@ public class BulkExecutor {
             boolean isLocalCall,
             boolean allowNonceIncrement,
             long blockRemainingEnergy,
+            boolean fork040Enable,
             Logger logger,
             PostExecutionWork work) {
 
@@ -108,6 +109,7 @@ public class BulkExecutor {
         this.blockRemainingEnergy = blockRemainingEnergy;
         this.logger = logger;
         this.postExecutionWork = work;
+        this.fork040enable = fork040Enable;
     }
 
     /**
@@ -136,11 +138,33 @@ public class BulkExecutor {
 
         this(
                 executionBatch,
+                repositoryChild,
+                isLocalCall,
+                allowNonceIncrement,
+                blockRemainingEnergy,
+                false,
+                logger,
+                work);
+    }
+
+    public BulkExecutor(
+            ExecutionBatch executionBatch,
+            RepositoryCache<AccountState, IBlockStoreBase<?, ?>> repositoryChild,
+            boolean isLocalCall,
+            boolean allowNonceIncrement,
+            long blockRemainingEnergy,
+            boolean fork040enable,
+            Logger logger,
+            PostExecutionWork work) {
+
+        this(
+                executionBatch,
                 null,
                 repositoryChild,
                 isLocalCall,
                 allowNonceIncrement,
                 blockRemainingEnergy,
+                fork040enable,
                 logger,
                 work);
     }
@@ -158,12 +182,19 @@ public class BulkExecutor {
                         this.executionBatch.getTransactions().get(currentIndex);
 
                 KernelInterface vmKernel;
+                IAionBlock block = executionBatch.getBlock();
+
                 if (transactionIsForAionVirtualMachine(firstTransactionInNextBatch)) {
                     vmKernel =
                             new KernelInterfaceForAVM(
                                     this.repositoryChild.startTracking(),
                                     this.allowNonceIncrement,
-                                    this.isLocalCall);
+                                    this.isLocalCall,
+                                    getDifficultyAsDataWord(block),
+                                    block.getNumber(),
+                                    block.getTimestamp(),
+                                    block.getNrgLimit(),
+                                    block.getCoinbase());
                     virtualMachineForNextBatch =
                             VirtualMachineProvider.getVirtualMachineInstance(VM.AVM, vmKernel);
                     nextBatchToExecute =
@@ -173,7 +204,14 @@ public class BulkExecutor {
                             new KernelInterfaceForFastVM(
                                     this.repositoryChild.startTracking(),
                                     this.allowNonceIncrement,
-                                    this.isLocalCall);
+                                    this.isLocalCall,
+                                    fork040enable,
+                                    getDifficultyAsDataWord(block),
+                                    block.getNumber(),
+                                    block.getTimestamp(),
+                                    block.getNrgLimit(),
+                                    block.getCoinbase());
+
                     virtualMachineForNextBatch =
                             VirtualMachineProvider.getVirtualMachineInstance(VM.FVM, vmKernel);
                     nextBatchToExecute =
@@ -197,12 +235,12 @@ public class BulkExecutor {
         List<AionTxExecSummary> summaries = new ArrayList<>();
 
         // Run the transactions.
+        Transaction[] txArray = new Transaction[details.size()];
         SimpleFuture<TransactionResult>[] resultsAsFutures =
-                virtualMachine.run(kernel, details.getExecutionContexts());
+                virtualMachine.run(kernel, details.getTransactions().toArray(txArray));
 
         // Process the results of the transactions.
         List<AionTransaction> transactions = details.getTransactions();
-        TransactionContext[] contexts = details.getExecutionContexts();
 
         int length = resultsAsFutures.length;
         for (int i = 0; i < length; i++) {
@@ -215,7 +253,6 @@ public class BulkExecutor {
             KernelInterface kernelFromVM = result.getKernelInterface();
 
             AionTransaction transaction = transactions.get(i);
-            TransactionContext context = contexts[i];
 
             // 1. Check the block energy limit & reject if necessary.
             long energyUsed = computeEnergyUsed(transaction.getEnergyLimit(), result);
@@ -231,9 +268,9 @@ public class BulkExecutor {
             }
 
             // 2. build the transaction summary and update the repository (the one backing
-            // this.kernel) with the contents of kernelFromVM accordingly.
+            // this kernel) with the contents of kernelFromVM accordingly.
             AionTxExecSummary summary =
-                    buildSummaryAndUpdateRepository(transaction, context, kernelFromVM, result);
+                    buildSummaryAndUpdateRepository(transaction, kernelFromVM, result);
 
             // 3. Do any post execution work and update the remaining block energy.
             this.blockRemainingEnergy -=
@@ -251,10 +288,7 @@ public class BulkExecutor {
     }
 
     private AionTxExecSummary buildSummaryAndUpdateRepository(
-            AionTransaction transaction,
-            TransactionContext context,
-            KernelInterface kernelFromVM,
-            TransactionResult result) {
+            AionTransaction transaction, KernelInterface kernelFromVM, TransactionResult result) {
 
         // TODO: should Avm assure us that this is always non-null like the fvm does? But in Avm
         // TODO: a null return value is actually meaningful. Need to figure this out.
@@ -264,9 +298,9 @@ public class BulkExecutor {
 
         SideEffects sideEffects = new SideEffects();
         if (result.getResultCode().isSuccess()) {
-            sideEffects.merge(context.getSideEffects());
+            sideEffects.merge(result.getSideEffects());
         } else {
-            sideEffects.addInternalTransactions(context.getSideEffects().getInternalTransactions());
+            sideEffects.addInternalTransactions(result.getSideEffects().getInternalTransactions());
         }
 
         // We have to do this for now, because the kernel uses the log serialization, which is not
@@ -286,15 +320,32 @@ public class BulkExecutor {
                         .result(result.getReturnData());
 
         ResultCode resultCode = result.getResultCode();
+        IAionBlock block = executionBatch.getBlock();
 
         if (transactionIsForAionVirtualMachine(transaction)) {
             kernelFromVM.commitTo(
                     new KernelInterfaceForAVM(
-                            this.repositoryChild, this.allowNonceIncrement, this.isLocalCall));
+                            this.repositoryChild,
+                            this.allowNonceIncrement,
+                            this.isLocalCall,
+                            getDifficultyAsDataWord(block),
+                            block.getNumber(),
+                            block.getTimestamp(),
+                            block.getNrgLimit(),
+                            block.getCoinbase()));
+
         } else {
             kernelFromVM.commitTo(
                     new KernelInterfaceForFastVM(
-                            this.repositoryChild, this.allowNonceIncrement, this.isLocalCall));
+                            this.repositoryChild,
+                            this.allowNonceIncrement,
+                            this.isLocalCall,
+                            this.fork040enable,
+                            getDifficultyAsDataWord(block),
+                            block.getNumber(),
+                            block.getTimestamp(),
+                            block.getNrgLimit(),
+                            block.getCoinbase()));
         }
 
         if (resultCode.isRejected()) {
@@ -414,9 +465,6 @@ public class BulkExecutor {
     }
 
     /**
-     * A transaction can only be for the avm if the avm is enabled. If it is not enabled this method
-     * always returns false.
-     *
      * Otherwise, assuming the avm is enabled, a transaction is for the Avm if, and only if, one of
      * the following is true:
      *
@@ -425,17 +473,12 @@ public class BulkExecutor {
      * not a contract address.
      */
     private boolean transactionIsForAionVirtualMachine(AionTransaction transaction) {
-        // first verify that the AVM is enabled
-        if (avmEnabled) {
-            if (transaction.isContractCreationTransaction()) {
-                return isValidAVMContractDeployment(transaction.getTargetVM());
-            } else {
-                Address destination = transaction.getDestinationAddress();
-                return isValidAVMContractDeployment(repositoryChild.getVMUsed(destination))
-                        || !isContractAddress(destination);
-            }
+        if (transaction.isContractCreationTransaction()) {
+            return isValidAVMContractDeployment(transaction.getTargetVM());
         } else {
-            return false;
+            Address destination = transaction.getDestinationAddress();
+            return isValidAVMContractDeployment(getVmType(destination))
+                    || !isContractAddress(destination);
         }
     }
 
@@ -448,5 +491,32 @@ public class BulkExecutor {
             byte[] code = cache.getCode(address);
             return (code != null) && (code.length > 0);
         }
+    }
+
+    private byte getVmType(Address destination) {
+        if (ContractFactory.isPrecompiledContract(destination)) {
+            // skip the call to disk
+            return TransactionTypes.FVM_CREATE_CODE;
+        } else {
+            byte storedVmType = repositoryChild.getVMUsed(destination);
+
+            // DEFAULT is returned when there was no contract information stored
+            if (storedVmType == TransactionTypes.DEFAULT) {
+                // will load contract into memory otherwise leading to consensus issues
+                RepositoryCache track = repositoryChild.startTracking();
+                return track.getVmType(destination);
+            } else {
+                return storedVmType;
+            }
+        }
+    }
+
+    private DataWord getDifficultyAsDataWord(IAionBlock block) {
+        // TODO: temp solution for difficulty length
+        byte[] diff = block.getDifficulty();
+        if (diff.length > 16) {
+            diff = Arrays.copyOfRange(diff, diff.length - 16, diff.length);
+        }
+        return new DataWordImpl(diff);
     }
 }

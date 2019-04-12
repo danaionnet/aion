@@ -1,9 +1,14 @@
 package org.aion.mcf.vm.types;
 
+import static org.aion.mcf.tx.TransactionTypes.FVM_CREATE_CODE;
+
+import com.google.common.annotations.VisibleForTesting;
 import java.math.BigInteger;
 import org.aion.interfaces.db.RepositoryCache;
+import org.aion.interfaces.vm.DataWord;
 import org.aion.mcf.core.AccountState;
 import org.aion.mcf.db.IBlockStoreBase;
+import org.aion.mcf.tx.TransactionTypes;
 import org.aion.mcf.valid.TransactionTypeRule;
 import org.aion.mcf.valid.TxNrgRule;
 import org.aion.types.Address;
@@ -13,11 +18,46 @@ import org.aion.vm.api.interfaces.KernelInterface;
 public class KernelInterfaceForFastVM implements KernelInterface {
     private RepositoryCache<AccountState, IBlockStoreBase<?, ?>> repositoryCache;
     private boolean allowNonceIncrement, isLocalCall;
+    private boolean fork040Enable;
+
+    @VisibleForTesting
+    public KernelInterfaceForFastVM(
+            RepositoryCache<AccountState, IBlockStoreBase<?, ?>> repositoryCache,
+            boolean allowNonceIncrement,
+            boolean isLocalCall,
+            DataWord blockDifficulty,
+            long blockNumber,
+            long blockTimestamp,
+            long blockNrgLimit,
+            Address blockCoinbase) {
+        this(
+                repositoryCache,
+                allowNonceIncrement,
+                isLocalCall,
+                false,
+                blockDifficulty,
+                blockNumber,
+                blockTimestamp,
+                blockNrgLimit,
+                blockCoinbase);
+    }
+
+    private DataWord blockDifficulty;
+    private long blockNumber;
+    private long blockTimestamp;
+    private long blockNrgLimit;
+    private Address blockCoinbase;
 
     public KernelInterfaceForFastVM(
             RepositoryCache<AccountState, IBlockStoreBase<?, ?>> repositoryCache,
             boolean allowNonceIncrement,
-            boolean isLocalCall) {
+            boolean isLocalCall,
+            boolean fork040Enable,
+            DataWord blockDifficulty,
+            long blockNumber,
+            long blockTimestamp,
+            long blockNrgLimit,
+            Address blockCoinbase) {
 
         if (repositoryCache == null) {
             throw new NullPointerException("Cannot set null repositoryCache!");
@@ -25,12 +65,26 @@ public class KernelInterfaceForFastVM implements KernelInterface {
         this.repositoryCache = repositoryCache;
         this.allowNonceIncrement = allowNonceIncrement;
         this.isLocalCall = isLocalCall;
+        this.fork040Enable = fork040Enable;
+        this.blockDifficulty = blockDifficulty;
+        this.blockNumber = blockNumber;
+        this.blockTimestamp = blockTimestamp;
+        this.blockNrgLimit = blockNrgLimit;
+        this.blockCoinbase = blockCoinbase;
     }
 
     @Override
     public KernelInterfaceForFastVM makeChildKernelInterface() {
         return new KernelInterfaceForFastVM(
-                this.repositoryCache.startTracking(), this.allowNonceIncrement, this.isLocalCall);
+                this.repositoryCache.startTracking(),
+                this.allowNonceIncrement,
+                this.isLocalCall,
+                this.fork040Enable,
+                this.blockDifficulty,
+                this.blockNumber,
+                this.blockTimestamp,
+                this.blockNrgLimit,
+                this.blockCoinbase);
     }
 
     @Override
@@ -57,6 +111,10 @@ public class KernelInterfaceForFastVM implements KernelInterface {
         this.repositoryCache.createAccount(address);
     }
 
+    public void setVmType(Address address) {
+        this.repositoryCache.saveVmType(address, FVM_CREATE_CODE);
+    }
+
     @Override
     public boolean hasAccountState(Address address) {
         return this.repositoryCache.hasAccountState(address);
@@ -64,6 +122,8 @@ public class KernelInterfaceForFastVM implements KernelInterface {
 
     @Override
     public void putCode(Address address, byte[] code) {
+        // ensure the vm type is set as soon as the account becomes a contract
+        this.repositoryCache.saveVmType(address, FVM_CREATE_CODE);
         this.repositoryCache.saveCode(address, code);
     }
 
@@ -73,14 +133,25 @@ public class KernelInterfaceForFastVM implements KernelInterface {
     }
 
     @Override
+    public byte[] getTransformedCode(Address address) {
+        // Todo:implement it for fvm later.
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public void setTransformedCode(Address address, byte[] code) {
+        // Todo:implement it for fvm later.
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
     public void putObjectGraph(Address contract, byte[] graph) {
-        //Todo: implement it when avm is ready.
+        throw new UnsupportedOperationException("The FVM does not use an object graph.");
     }
 
     @Override
     public byte[] getObjectGraph(Address contract) {
-        //Todo: implement it when avm is ready.
-        return new byte[0];
+        throw new UnsupportedOperationException("The FVM does not use an object graph.");
     }
 
     @Override
@@ -94,12 +165,18 @@ public class KernelInterfaceForFastVM implements KernelInterface {
         }
 
         this.repositoryCache.addStorageRow(address, storageKey, storageValue);
+        if (this.repositoryCache.getVmType(address) != FVM_CREATE_CODE) {
+            this.repositoryCache.saveVmType(address, FVM_CREATE_CODE);
+        }
     }
 
     @Override
     public void removeStorage(Address address, byte[] key) {
         ByteArrayWrapper storageKey = alignDataToWordSize(key);
         this.repositoryCache.removeStorageRow(address, storageKey);
+        if (this.repositoryCache.getVmType(address) != FVM_CREATE_CODE) {
+            this.repositoryCache.saveVmType(address, FVM_CREATE_CODE);
+        }
     }
 
     @Override
@@ -191,7 +268,20 @@ public class KernelInterfaceForFastVM implements KernelInterface {
 
     @Override
     public boolean destinationAddressIsSafeForThisVM(Address address) {
-        return TransactionTypeRule.isValidFVMContractDeployment(repositoryCache.getVMUsed(address));
+        return TransactionTypeRule.isValidFVMCode(getVmType(address));
+    }
+
+    private byte getVmType(Address destination) {
+        byte storedVmType = repositoryCache.getVMUsed(destination);
+
+        // DEFAULT is returned when there was no contract information stored
+        if (storedVmType == TransactionTypes.DEFAULT) {
+            // will load contract into memory otherwise leading to consensus issues
+            RepositoryCache track = repositoryCache.startTracking();
+            return track.getVmType(destination);
+        } else {
+            return storedVmType;
+        }
     }
 
     /**
@@ -242,5 +332,38 @@ public class KernelInterfaceForFastVM implements KernelInterface {
         } else {
             return new ByteArrayWrapper(new DataWordImpl(data).getData());
         }
+    }
+
+    public boolean isFork040Enable() {
+        return this.fork040Enable;
+    }
+
+    @Override
+    public long getBlockNumber() {
+        return blockNumber;
+    }
+
+    @Override
+    public long getBlockTimestamp() {
+        return blockTimestamp;
+    }
+
+    @Override
+    public long getBlockEnergyLimit() {
+        return blockNrgLimit;
+    }
+
+    @Override
+    public long getBlockDifficulty() {
+        if (blockDifficulty instanceof DataWordImpl) {
+            return ((DataWordImpl) blockDifficulty).longValue();
+        } else {
+            return ((DoubleDataWord) blockDifficulty).longValue();
+        }
+    }
+
+    @Override
+    public Address getMinerAddress() {
+        return blockCoinbase;
     }
 }

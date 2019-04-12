@@ -1,12 +1,17 @@
 package org.aion.vm;
 
+import static org.aion.mcf.tx.TransactionTypes.AVM_CREATE_CODE;
+
 import java.math.BigInteger;
 import org.aion.interfaces.db.RepositoryCache;
+import org.aion.interfaces.vm.DataWord;
 import org.aion.mcf.core.AccountState;
 import org.aion.mcf.db.IBlockStoreBase;
+import org.aion.mcf.tx.TransactionTypes;
 import org.aion.mcf.valid.TransactionTypeRule;
 import org.aion.mcf.valid.TxNrgRule;
-import org.aion.mcf.vm.types.KernelInterfaceForFastVM;
+import org.aion.mcf.vm.types.DataWordImpl;
+import org.aion.mcf.vm.types.DoubleDataWord;
 import org.aion.precompiled.ContractFactory;
 import org.aion.types.Address;
 import org.aion.types.ByteArrayWrapper;
@@ -16,10 +21,21 @@ public class KernelInterfaceForAVM implements KernelInterface {
     private RepositoryCache<AccountState, IBlockStoreBase<?, ?>> repositoryCache;
     private boolean allowNonceIncrement, isLocalCall;
 
+    private DataWord blockDifficulty;
+    private long blockNumber;
+    private long blockTimestamp;
+    private long blockNrgLimit;
+    private Address blockCoinbase;
+
     public KernelInterfaceForAVM(
             RepositoryCache<AccountState, IBlockStoreBase<?, ?>> repositoryCache,
             boolean allowNonceIncrement,
-            boolean isLocalCall) {
+            boolean isLocalCall,
+            DataWord blockDifficulty,
+            long blockNumber,
+            long blockTimestamp,
+            long blockNrgLimit,
+            Address blockCoinbase) {
 
         if (repositoryCache == null) {
             throw new NullPointerException("Cannot set null repositoryCache!");
@@ -27,12 +43,24 @@ public class KernelInterfaceForAVM implements KernelInterface {
         this.repositoryCache = repositoryCache;
         this.allowNonceIncrement = allowNonceIncrement;
         this.isLocalCall = isLocalCall;
+        this.blockDifficulty = blockDifficulty;
+        this.blockNumber = blockNumber;
+        this.blockTimestamp = blockTimestamp;
+        this.blockNrgLimit = blockNrgLimit;
+        this.blockCoinbase = blockCoinbase;
     }
 
     @Override
     public KernelInterfaceForAVM makeChildKernelInterface() {
         return new KernelInterfaceForAVM(
-                this.repositoryCache.startTracking(), this.allowNonceIncrement, this.isLocalCall);
+                this.repositoryCache.startTracking(),
+                this.allowNonceIncrement,
+                this.isLocalCall,
+                this.blockDifficulty,
+                this.blockNumber,
+                this.blockTimestamp,
+                this.blockNrgLimit,
+                this.blockCoinbase);
     }
 
     @Override
@@ -66,6 +94,8 @@ public class KernelInterfaceForAVM implements KernelInterface {
 
     @Override
     public void putCode(Address address, byte[] code) {
+        // ensure the vm type is set as soon as the account becomes a contract
+        this.repositoryCache.saveVmType(address, AVM_CREATE_CODE);
         this.repositoryCache.saveCode(address, code);
     }
 
@@ -75,14 +105,26 @@ public class KernelInterfaceForAVM implements KernelInterface {
     }
 
     @Override
+    public byte[] getTransformedCode(Address address) {
+        return this.repositoryCache.getTransformedCode(address);
+    }
+
+    @Override
+    public void setTransformedCode(Address address, byte[] transformedCode) {
+        this.repositoryCache.setTransformedCode(address, transformedCode);
+    }
+
+    @Override
     public void putObjectGraph(Address contract, byte[] graph) {
-        //Todo: implement it when avm is ready.
+        this.repositoryCache.saveObjectGraph(contract, graph);
+        if (this.repositoryCache.getVmType(contract) != AVM_CREATE_CODE) {
+            this.repositoryCache.saveVmType(contract, AVM_CREATE_CODE);
+        }
     }
 
     @Override
     public byte[] getObjectGraph(Address contract) {
-        //Todo: implement it when avm is ready.
-        return new byte[0];
+        return this.repositoryCache.getObjectGraph(contract);
     }
 
     @Override
@@ -90,12 +132,18 @@ public class KernelInterfaceForAVM implements KernelInterface {
         ByteArrayWrapper storageKey = new ByteArrayWrapper(key);
         ByteArrayWrapper storageValue = new ByteArrayWrapper(value);
         this.repositoryCache.addStorageRow(address, storageKey, storageValue);
+        if (this.repositoryCache.getVmType(address) != AVM_CREATE_CODE) {
+            this.repositoryCache.saveVmType(address, AVM_CREATE_CODE);
+        }
     }
 
     @Override
     public void removeStorage(Address address, byte[] key) {
         ByteArrayWrapper storageKey = new ByteArrayWrapper(key);
         this.repositoryCache.addStorageRow(address, storageKey, ByteArrayWrapper.ZERO);
+        if (this.repositoryCache.getVmType(address) != AVM_CREATE_CODE) {
+            this.repositoryCache.saveVmType(address, AVM_CREATE_CODE);
+        }
     }
 
     @Override
@@ -162,22 +210,22 @@ public class KernelInterfaceForAVM implements KernelInterface {
 
     @Override
     public boolean accountNonceEquals(Address address, BigInteger nonce) {
-        return (this.isLocalCall) ? true : getNonce(address).equals(nonce);
+        return (this.isLocalCall) || getNonce(address).equals(nonce);
     }
 
     @Override
     public boolean accountBalanceIsAtLeast(Address address, BigInteger amount) {
-        return (this.isLocalCall) ? true : getBalance(address).compareTo(amount) >= 0;
+        return (this.isLocalCall) || getBalance(address).compareTo(amount) >= 0;
     }
 
     @Override
     public boolean isValidEnergyLimitForCreate(long energyLimit) {
-        return (this.isLocalCall) ? true : TxNrgRule.isValidNrgContractCreate(energyLimit);
+        return (this.isLocalCall) || TxNrgRule.isValidNrgContractCreate(energyLimit);
     }
 
     @Override
     public boolean isValidEnergyLimitForNonCreate(long energyLimit) {
-        return (this.isLocalCall) ? true : TxNrgRule.isValidNrgTx(energyLimit);
+        return (this.isLocalCall) || TxNrgRule.isValidNrgTx(energyLimit);
     }
 
     @Override
@@ -193,6 +241,48 @@ public class KernelInterfaceForAVM implements KernelInterface {
         }
 
         // Otherwise, it must be an Avm contract address.
-        return TransactionTypeRule.isValidAVMContractDeployment(repositoryCache.getVMUsed(address));
+        return TransactionTypeRule.isValidAVMCode(getVmType(address));
+    }
+
+    private byte getVmType(Address destination) {
+        byte storedVmType = repositoryCache.getVMUsed(destination);
+
+        // DEFAULT is returned when there was no contract information stored
+        if (storedVmType == TransactionTypes.DEFAULT) {
+            // will load contract into memory otherwise leading to consensus issues
+            RepositoryCache track = repositoryCache.startTracking();
+            return track.getVmType(destination);
+        } else {
+            return storedVmType;
+        }
+    }
+
+    @Override
+    public long getBlockNumber() {
+        return blockNumber;
+    }
+
+    @Override
+    public long getBlockTimestamp() {
+        return blockTimestamp;
+    }
+
+    @Override
+    public long getBlockEnergyLimit() {
+        return blockNrgLimit;
+    }
+
+    @Override
+    public long getBlockDifficulty() {
+        if (blockDifficulty instanceof DataWordImpl) {
+            return ((DataWordImpl) blockDifficulty).longValue();
+        } else {
+            return ((DoubleDataWord) blockDifficulty).longValue();
+        }
+    }
+
+    @Override
+    public Address getMinerAddress() {
+        return blockCoinbase;
     }
 }

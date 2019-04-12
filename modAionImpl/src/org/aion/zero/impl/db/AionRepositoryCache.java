@@ -193,7 +193,8 @@ public class AionRepositoryCache implements RepositoryCache<AccountState, IBlock
             } else {
                 // copy the objects if they were cached locally
                 accounts.put(address, new AccountState(accountState));
-                details.put(address, new ContractDetailsCacheImpl(contractDetails));
+                ContractDetails cd = new ContractDetailsCacheImpl(contractDetails);
+                details.put(address, cd);
             }
         } finally {
             fullyReadUnlock();
@@ -222,7 +223,11 @@ public class AionRepositoryCache implements RepositoryCache<AccountState, IBlock
         fullyWriteLock();
         try {
             getAccountState(address).delete();
-            getContractDetails(address).setDeleted(true);
+            ContractDetails cd = getContractDetails(address);
+            if (cd != null) {
+                cd.setTransformedCode(null);
+                cd.setDeleted(true);
+            }
         } finally {
             fullyWriteUnlock();
         }
@@ -307,6 +312,64 @@ public class AionRepositoryCache implements RepositoryCache<AccountState, IBlock
 
         // TODO: why use codeHash here? may require refactoring
         return getContractDetails(address).getCode(codeHash);
+    }
+
+    @Override
+    public byte[] getTransformedCode(Address address) {
+        if (!hasAccountState(address)) {
+            return null;
+        }
+
+        return getContractDetails(address).getTransformedCode();
+    }
+
+    @Override
+    public void saveVmType(Address contract, byte vmType) {
+        fullyWriteLock();
+        try {
+            getContractDetails(contract).setVmType(vmType);
+        } finally {
+            fullyWriteUnlock();
+        }
+    }
+
+    /** IMPORTNAT: a new cache must be created before calling this method */
+    @Override
+    public byte getVmType(Address contract) {
+        // retrieving the VM type involves updating the contract details values
+        // this requires loading the account and details
+        fullyWriteLock();
+        try {
+            return getContractDetails(contract).getVmType();
+        } finally {
+            fullyWriteUnlock();
+        }
+    }
+
+    @Override
+    public void saveObjectGraph(Address contract, byte[] graph) {
+        // TODO: unsure about impl
+        fullyWriteLock();
+        try {
+            // this change will mark the contract as dirty (requires update in the db)
+            ContractDetails contractDetails = getContractDetails(contract);
+            contractDetails.setObjectGraph(graph);
+
+            // update the storage hash
+            getAccountState(contract).setStateRoot(contractDetails.getStorageHash());
+        } finally {
+            fullyWriteUnlock();
+        }
+    }
+
+    @Override
+    public byte[] getObjectGraph(Address contract) {
+        fullyWriteLock();
+        try {
+            return getContractDetails(contract).getObjectGraph();
+        } finally {
+            fullyWriteUnlock();
+        }
     }
 
     @Override
@@ -623,5 +686,31 @@ public class AionRepositoryCache implements RepositoryCache<AccountState, IBlock
 
     public byte getVMUsed(Address contract) {
         return repository.getVMUsed(contract);
+    }
+
+    @Override
+    public void setTransformedCode(Address contractAddr, byte[] code) {
+        if (contractAddr == null || code == null) {
+            throw new NullPointerException();
+        }
+
+        fullyWriteLock();
+        try {
+            if (!hasAccountState(contractAddr)) {
+                LOG.debug("No accountState of the account: {}", contractAddr);
+                return;
+            }
+
+            ContractDetails cd = getContractDetails(contractAddr);
+            if (cd == null) {
+                LOG.debug("No contract detail of account: {}", contractAddr);
+                return;
+            }
+
+            cd.setTransformedCode(code);
+            cd.setDirty(true);
+        } finally{
+            fullyWriteUnlock();
+        }
     }
 }
